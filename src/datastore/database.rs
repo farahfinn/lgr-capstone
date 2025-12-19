@@ -1,24 +1,30 @@
+use crate::datastore::error::DbError;
+
 use super::{Record, Result};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 /// The main datastore struct.
 /// It holds a file handle to the data file & an in-memory index
 pub struct EmbeddedDatabase {
     file: File,
     index: HashMap<String, u64>, // Maps key to byte offset in the file
+    path: PathBuf,               // Used to store the path to the db file
 }
 
 impl EmbeddedDatabase {
     /// Creates a new EmbeddedDatabase or opens an existing one from a db file
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref(); // Convert generic P into a concrete &Path
+
         let mut file = OpenOptions::new()
             .read(true) // Allow reading
             .write(true) // Allow writing
             .create(true) // Create if it does not exist
+            .truncate(false)
             .open(path)?;
         let mut index = HashMap::new();
         let mut position = 0;
@@ -55,7 +61,11 @@ impl EmbeddedDatabase {
             position += 8 + len;
         }
 
-        Ok(EmbeddedDatabase { file, index })
+        Ok(EmbeddedDatabase {
+            file,
+            index,
+            path: path.to_path_buf(),
+        })
     }
     /// Serialize a K, V pair and append it to the data file as well as update
     /// in memory idx in order to find the data later without scanning the file.
@@ -143,10 +153,74 @@ impl EmbeddedDatabase {
 
         Ok(())
     }
+
+    pub fn compact(&mut self) -> Result<()> {
+        // Create a path for the new compacted file.
+        // For a db at "my.db", this might be "my.db.compact"
+        let mut compact_file_path = self.path.clone();
+        compact_file_path.add_extension("compact");
+
+        // Open the new file
+        let mut compact_db_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&compact_file_path)?;
+
+        // Create a new idx for the compacted data
+        let mut compact_index = HashMap::new();
+
+        // Initialize a counter for the new file's record positions
+        let mut new_position: u64 = 0;
+
+        // Note: We need to clone the keys, because we are borrowing `self` mutably
+        // later inside the loop when we call `self.file.seek`
+        let keys: Vec<String> = self.index.keys().cloned().collect();
+
+        for key in keys {
+            // Get the position of the live record from the old idx
+            let position = self
+                .index
+                .get(&key)
+                .ok_or_else(|| DbError::CompactionKeyNotFound(key.clone()))?;
+
+            // Seek to that record in the old file
+            self.file.seek(std::io::SeekFrom::Start(*position))?;
+
+            // Read the 8-byte length of the record
+            let mut record_len_buffer = [0u8; 8];
+            self.file.read_exact(&mut record_len_buffer)?;
+            let len_of_record = u64::from_le_bytes(record_len_buffer);
+
+            // Read the full record data
+            let mut record_buffer = vec![0u8; len_of_record as usize];
+            self.file.read_exact(&mut record_buffer)?;
+
+            // Write the length & the record data to the new compacted file
+            compact_db_file.write_all(&record_len_buffer)?;
+            compact_db_file.write_all(&record_buffer)?;
+
+            // Update the new idx with the key and its new position
+            compact_index.insert(key, new_position);
+
+            new_position += 8 + len_of_record;
+        }
+        // Atomically replace the old database file with the new, compacted one.
+        std::fs::rename(&compact_file_path, &self.path)?;
+
+        // Reopen the file handle to point to the new db file.
+        // We now want to read & write to the main path
+        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+
+        // Update the new in memory idx to be the compacted_index
+        self.index = compact_index;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod test {
+
     use super::*;
     use tempfile::NamedTempFile;
     #[test]
@@ -203,5 +277,64 @@ mod test {
             None,
             "The key should still be deleted after reopening "
         );
+    }
+
+    #[test]
+    fn test_compaction() {
+        let temp_file = NamedTempFile::new().expect("failed to create a temp file");
+        let db_path = temp_file.path();
+
+        // Create a db & set multiple values
+        let mut db =
+            EmbeddedDatabase::new(db_path).expect(" creating a db using the temp file path failed");
+        db.set("Name1", "Alice").expect("Failed to create a record");
+        db.set("Name2", "Bob").expect("failed to create a record");
+        db.set("Name3", "Joe").expect("failed to set a record");
+
+        // Update some records
+        db.set("Name1", "Janet").unwrap();
+        db.set("Name3", "Finn").unwrap();
+
+        // Delet some keys, creating tombstone records
+        db.delete("Name2").unwrap();
+
+        // Add another key after deletion
+        db.set("Name4", "Adam").unwrap();
+
+        // Verify initial state before compaction (including dead records)
+        assert_eq!(db.get("Name1").unwrap(), Some("Janet".to_string()));
+        assert_eq!(db.get("Name2").unwrap(), None);
+        assert_eq!(db.get("Name3").unwrap(), Some("Finn".to_string()));
+        assert_eq!(db.get("Name4").unwrap(), Some("Adam".to_string()));
+
+        // Store initial file size for comparison
+        let initial_db_file_size = db.file.metadata().unwrap().len();
+
+        // Perform compaction
+        db.compact().expect("failed to compact");
+
+        // Verify that the all llive keys are still accessible & hold correct values
+        assert_eq!(db.get("Name1").unwrap(), Some("Janet".to_string()));
+        assert_eq!(db.get("Name2").unwrap(), None);
+        assert_eq!(db.get("Name3").unwrap(), Some("Finn".to_string()));
+        assert_eq!(db.get("Name4").unwrap(), Some("Adam".to_string()));
+
+        // Verify that deleted keys are no longer present
+
+        // Verify that file size has decreased
+        let new_db_file_size = std::fs::metadata(db.path.clone()).unwrap().len();
+        assert!(initial_db_file_size > new_db_file_size);
+
+        // Reopen the database to verify persistence after compaction
+        drop(db);
+
+        let mut db =
+            EmbeddedDatabase::new(db_path).expect(" creating a db using the temp file path failed");
+
+        // Verify that the data is still accessible & hold correct values
+        assert_eq!(db.get("Name1").unwrap(), Some("Janet".to_string()));
+        assert_eq!(db.get("Name2").unwrap(), None);
+        assert_eq!(db.get("Name3").unwrap(), Some("Finn".to_string()));
+        assert_eq!(db.get("Name4").unwrap(), Some("Adam".to_string()));
     }
 }
