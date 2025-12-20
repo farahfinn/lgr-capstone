@@ -132,7 +132,7 @@ impl EmbeddedDatabase {
 
         Ok(Some(record.val))
     }
-
+    /// Deletes a record from the live database
     pub fn delete(&mut self, key: &str) -> Result<()> {
         // Create a tombstone record with an empty value
         let record = Record {
@@ -154,7 +154,8 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
-    pub fn compact(&mut self) -> Result<()> {
+    /// Closes the database, performing compaction.
+    pub fn close(&mut self) -> Result<()> {
         // Create a path for the new compacted file.
         // For a db at "my.db", this might be "my.db.compact"
         let mut compact_file_path = self.path.clone();
@@ -164,6 +165,7 @@ impl EmbeddedDatabase {
         let mut compact_db_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&compact_file_path)?;
 
         // Create a new idx for the compacted data
@@ -311,7 +313,7 @@ mod test {
         let initial_db_file_size = db.file.metadata().unwrap().len();
 
         // Perform compaction
-        db.compact().expect("failed to compact");
+        db.close().expect("failed to close and compact");
 
         // Verify that the all llive keys are still accessible & hold correct values
         assert_eq!(db.get("Name1").unwrap(), Some("Janet".to_string()));
