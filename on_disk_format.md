@@ -72,7 +72,7 @@ _*Note on lengths: The actual byte length of the serialized data depends on the 
 
 ---
 
-### Index Reconstruction
+### Index Reconstruction and Compaction
 
 When the database is started (`EmbeddedDatabase::new`), it reads this file from start to finish to rebuild the in-memory index:
 
@@ -83,4 +83,32 @@ When the database is started (`EmbeddedDatabase::new`), it reads this file from 
 3.  **Reads Record 3**: It sees the tombstone record `{ key: "name", val: "" }`. Because the value is empty, it **removes** `"name"` from the index.
     *   `index` is now `{ "city": 19 }`
 
-The final in-memory index accurately reflects the live, non-deleted data. The old record for `"name"` at byte 0 still exists on disk but is now "dead" space, as it is no longer referenced by the index.
+The final in-memory index accurately reflects the live, non-deleted data. The old record for `"name"` at byte 0 still exists on disk but is now "dead" space.
+
+To reclaim this space, the user can call the `close()` method, which triggers **compaction**. This process writes a new database file containing only the live data (`{"city": 19}`) and then atomically replaces the old file.
+
+---
+
+## Project Roadmap
+
+This section outlines potential future enhancements to the database.
+
+### 1. API Ergonomics (Generics)
+- **Goal:** Allow the database to store any serializable key and value, not just strings.
+- **Task:** Convert `Record`, `set`, and `get` to use generic types `<K, V>` with trait bounds requiring `serde::Serialize` and `serde::Deserialize`.
+- **Benefit:** Greatly improves the reusability and flexibility of the library.
+
+### 2. Corruption Detection (Checksums)
+- **Goal:** Ensure data integrity on disk.
+- **Task:** Add a checksum field (e.g., CRC32) to the on-disk record format. The checksum would be calculated on `set` and verified on `get` and during index reconstruction.
+- **Benefit:** Protects against silent data corruption from hardware faults or other issues.
+
+### 3. Faster Startup (Index Snapshots)
+- **Goal:** Reduce database startup time for very large files.
+- **Task:** Modify `close()` to save a snapshot of the in-memory index to a separate file. The `new()` method would then load from this snapshot first, only scanning the main data file for records added since the snapshot was made.
+- **Benefit:** Dramatically improves performance for databases with a large number of records.
+
+### 4. Asynchronous API (`async/await`)
+- **Goal:** Make the database non-blocking, suitable for high-concurrency applications like web servers.
+- **Task:** Refactor all file I/O operations to be `async` using a runtime like `tokio`. This would involve changing method signatures to `async fn` and using `.await` on I/O calls.
+- **Benefit:** Enables the database to handle many simultaneous requests efficiently without blocking threads.
